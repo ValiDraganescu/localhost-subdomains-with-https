@@ -1,4 +1,4 @@
-# localhost-subdomains
+# localhost-subdomains-with-https
 
 A single, idempotent Bash script that gives you **HTTPS subdomains on localhost** for macOS development. Run it as many times as you want — it only creates what's missing.
 
