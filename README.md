@@ -56,9 +56,12 @@ Each run goes through these steps, skipping anything already done:
 | 2    | Install local CA into all trust stores          | Already trusted (still runs, is idempotent)   |
 | 3    | Generate TLS cert covering all configured subdomains | Cert exists and no new domains added     |
 | 4    | Create/update the proxy config                  | File exists / mapping already present         |
-| 5    | Start or reload the proxy                       | Already running with no config/cert changes   |
+| 5    | Install a macOS LaunchDaemon for the proxy      | Plist already exists and up to date           |
+| 6    | Start or reload the proxy via launchd           | Already running with no config/cert changes   |
 
 Certificates and proxy configs are stored in `~/.local/dev-certs/`.
+
+The proxy is registered as a **macOS LaunchDaemon**, so it starts automatically on boot and restarts if it crashes. No need to re-run the script after a reboot.
 
 ### Why not a wildcard certificate?
 
@@ -115,22 +118,24 @@ Run the same subdomain with a different port — the script detects the change a
 
 ### Managing the proxy
 
+The proxy runs as a macOS LaunchDaemon and starts automatically on boot.
+
 #### Caddy
 
 ```bash
-sudo caddy stop
-sudo caddy start --config ~/.local/dev-certs/Caddyfile
-sudo caddy run --config ~/.local/dev-certs/Caddyfile    # foreground
-caddy reload --config ~/.local/dev-certs/Caddyfile
+sudo launchctl unload /Library/LaunchDaemons/com.local-dev.caddy.plist   # stop
+sudo launchctl load /Library/LaunchDaemons/com.local-dev.caddy.plist     # start
+caddy reload --config ~/.local/dev-certs/Caddyfile                       # reload config
+cat ~/.local/dev-certs/caddy-logs/caddy-error.log                        # logs
 ```
 
 #### nginx
 
 ```bash
-sudo nginx -s stop -c ~/.local/dev-certs/nginx.conf
-sudo nginx -c ~/.local/dev-certs/nginx.conf
-sudo nginx -s reload -c ~/.local/dev-certs/nginx.conf
-tail -f ~/.local/dev-certs/nginx-logs/error.log          # logs
+sudo launchctl unload /Library/LaunchDaemons/com.local-dev.nginx.plist   # stop
+sudo launchctl load /Library/LaunchDaemons/com.local-dev.nginx.plist     # start
+sudo nginx -s reload -c ~/.local/dev-certs/nginx.conf                    # reload config
+tail -f ~/.local/dev-certs/nginx-logs/error.log                          # logs
 ```
 
 ## Architecture
@@ -144,8 +149,8 @@ lib/
     brew.sh                   # Install packages via Homebrew
     nix.sh                    # Install packages via Nix
   proxy/
-    caddy.sh                  # Caddyfile management, caddy start/reload
-    nginx.sh                  # nginx.conf management, nginx start/reload
+    caddy.sh                  # Caddyfile management, launchd service
+    nginx.sh                  # nginx.conf management, launchd service
 ```
 
 The entry point auto-detects your package manager, loads the appropriate **pkg driver** and **proxy driver**, then runs a shared pipeline:
@@ -194,14 +199,19 @@ Each package driver (`lib/pkg/*.sh`) implements:
 | Caddyfile | `~/.local/dev-certs/Caddyfile` |
 | nginx config | `~/.local/dev-certs/nginx.conf` |
 | nginx logs | `~/.local/dev-certs/nginx-logs/` |
+| Caddy logs | `~/.local/dev-certs/caddy-logs/` |
+| Caddy LaunchDaemon | `/Library/LaunchDaemons/com.local-dev.caddy.plist` |
+| nginx LaunchDaemon | `/Library/LaunchDaemons/com.local-dev.nginx.plist` |
 | CA root cert | `$(mkcert -CAROOT)/rootCA.pem` |
 
 ## Uninstall
 
 ```bash
-# Stop the proxy
-sudo caddy stop           # if using caddy
-sudo nginx -s stop        # if using nginx
+# Stop and remove the LaunchDaemon
+sudo launchctl unload /Library/LaunchDaemons/com.local-dev.caddy.plist 2>/dev/null
+sudo rm -f /Library/LaunchDaemons/com.local-dev.caddy.plist
+sudo launchctl unload /Library/LaunchDaemons/com.local-dev.nginx.plist 2>/dev/null
+sudo rm -f /Library/LaunchDaemons/com.local-dev.nginx.plist
 
 # Remove certificates and config
 rm -rf ~/.local/dev-certs

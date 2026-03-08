@@ -77,17 +77,94 @@ EOF
     fi
 }
 
-manage_proxy() {
-    log_step "Managing Caddy process"
+CADDY_PLIST_LABEL="com.local-dev.caddy"
+CADDY_PLIST_PATH="/Library/LaunchDaemons/${CADDY_PLIST_LABEL}.plist"
+CADDY_LOG_DIR="$CERT_DIR/caddy-logs"
 
-    local needs_action=false
-    if [[ "$PROXY_CONFIG_CHANGED" == true || "$CERT_NEEDS_REGEN" == true ]]; then
-        needs_action=true
+_caddy_generate_plist() {
+    local caddy_bin="$1"
+    cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${CADDY_PLIST_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${caddy_bin}</string>
+        <string>run</string>
+        <string>--config</string>
+        <string>${PROXY_CONFIG}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${CADDY_LOG_DIR}/caddy.log</string>
+    <key>StandardErrorPath</key>
+    <string>${CADDY_LOG_DIR}/caddy-error.log</string>
+</dict>
+</plist>
+EOF
+}
+
+manage_proxy() {
+    log_step "Managing Caddy service (launchd)"
+
+    local caddy_bin
+    caddy_bin="$(command -v caddy)"
+    mkdir -p "$CADDY_LOG_DIR"
+
+    # Generate desired plist content
+    local plist_content
+    plist_content="$(_caddy_generate_plist "$caddy_bin")"
+
+    # Install or update the LaunchDaemon plist if needed
+    local plist_changed=false
+    if [[ ! -f "$CADDY_PLIST_PATH" ]] || ! echo "$plist_content" | diff - "$CADDY_PLIST_PATH" &>/dev/null; then
+        # Unload existing service before updating plist
+        if sudo launchctl list "$CADDY_PLIST_LABEL" &>/dev/null; then
+            log_info "Unloading existing Caddy service..."
+            sudo launchctl unload "$CADDY_PLIST_PATH" 2>/dev/null || true
+        fi
+        # Stop any non-launchd caddy process
+        if pgrep -x caddy &>/dev/null; then
+            log_info "Stopping existing Caddy process (migrating to launchd)..."
+            sudo caddy stop 2>/dev/null || sudo pkill -x caddy 2>/dev/null || true
+            sleep 1
+        fi
+        log_info "Installing LaunchDaemon plist for Caddy..."
+        echo "$plist_content" | sudo tee "$CADDY_PLIST_PATH" > /dev/null
+        sudo chmod 644 "$CADDY_PLIST_PATH"
+        sudo chown root:wheel "$CADDY_PLIST_PATH"
+        log_ok "LaunchDaemon installed at $CADDY_PLIST_PATH"
+        plist_changed=true
+    else
+        log_ok "LaunchDaemon plist is up to date"
     fi
 
-    if pgrep -x caddy &>/dev/null; then
-        log_ok "Caddy is already running (PID: $(pgrep -x caddy | head -1))"
-        if [[ "$needs_action" == true ]]; then
+    # Ensure the service is loaded and running
+    if ! sudo launchctl list "$CADDY_PLIST_LABEL" &>/dev/null || [[ "$plist_changed" == true ]]; then
+        # Stop any rogue caddy process before launchd takes over
+        if pgrep -x caddy &>/dev/null; then
+            sudo caddy stop 2>/dev/null || sudo pkill -x caddy 2>/dev/null || true
+            sleep 1
+        fi
+        log_info "Loading Caddy LaunchDaemon (starts now and on every boot)..."
+        sudo launchctl load "$CADDY_PLIST_PATH"
+        sleep 1
+        if pgrep -x caddy &>/dev/null; then
+            log_ok "Caddy started via launchd (PID: $(pgrep -x caddy | head -1))"
+        else
+            log_err "Caddy failed to start via launchd. Check logs:"
+            log_info "  cat $CADDY_LOG_DIR/caddy-error.log"
+            exit 1
+        fi
+    else
+        log_ok "Caddy is running via launchd (PID: $(pgrep -x caddy | head -1 || echo 'unknown'))"
+        if [[ "$PROXY_CONFIG_CHANGED" == true || "$CERT_NEEDS_REGEN" == true ]]; then
             log_info "Configuration or certificates changed, reloading..."
             caddy reload --config "$PROXY_CONFIG" 2>/dev/null && \
                 log_ok "Caddy reloaded with new configuration" || \
@@ -95,17 +172,6 @@ manage_proxy() {
                   caddy reload --config "$PROXY_CONFIG" --force && log_ok "Caddy force-reloaded"; }
         else
             log_info "No changes, skipping reload"
-        fi
-    else
-        log_info "Starting Caddy in the background..."
-        log_info "Caddy needs to bind to port 443 — may prompt for sudo password"
-        sudo caddy start --config "$PROXY_CONFIG"
-        if pgrep -x caddy &>/dev/null; then
-            log_ok "Caddy started (PID: $(pgrep -x caddy | head -1))"
-        else
-            log_err "Caddy failed to start. Run manually for details:"
-            log_info "  sudo caddy run --config $PROXY_CONFIG"
-            exit 1
         fi
     fi
 }
@@ -125,7 +191,8 @@ print_active_mappings() {
 }
 
 print_management_commands() {
-    echo "  Stop:    sudo caddy stop"
-    echo "  Logs:    sudo caddy run --config $PROXY_CONFIG  (foreground)"
+    echo "  Stop:    sudo launchctl unload $CADDY_PLIST_PATH"
+    echo "  Start:   sudo launchctl load $CADDY_PLIST_PATH"
+    echo "  Logs:    cat $CADDY_LOG_DIR/caddy-error.log"
     echo "  Reload:  caddy reload --config $PROXY_CONFIG"
 }

@@ -123,19 +123,45 @@ EOF
     fi
 }
 
+NGINX_PLIST_LABEL="com.local-dev.nginx"
+NGINX_PLIST_PATH="/Library/LaunchDaemons/${NGINX_PLIST_LABEL}.plist"
+
+_nginx_generate_plist() {
+    local nginx_bin="$1"
+    cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${NGINX_PLIST_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${nginx_bin}</string>
+        <string>-c</string>
+        <string>${PROXY_CONFIG}</string>
+        <string>-g</string>
+        <string>daemon off;</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${NGINX_LOG_DIR}/launchd-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>${NGINX_LOG_DIR}/launchd-stderr.log</string>
+</dict>
+</plist>
+EOF
+}
+
 manage_proxy() {
-    log_step "Managing nginx process"
+    log_step "Managing nginx service (launchd)"
 
-    local needs_action=false
-    if [[ "$PROXY_CONFIG_CHANGED" == true || "$CERT_NEEDS_REGEN" == true ]]; then
-        needs_action=true
-    fi
-
-    # Check if nginx is running via pid file
-    local nginx_running=false
-    if [[ -f "$NGINX_PID_FILE" ]] && kill -0 "$(cat "$NGINX_PID_FILE")" 2>/dev/null; then
-        nginx_running=true
-    fi
+    local nginx_bin
+    nginx_bin="$(command -v nginx)"
+    mkdir -p "$NGINX_LOG_DIR" "$NGINX_TEMP_DIR"
 
     # Validate config before any action
     if ! nginx -t -c "$PROXY_CONFIG" 2>/dev/null; then
@@ -145,28 +171,61 @@ manage_proxy() {
     fi
     log_ok "nginx config is valid"
 
-    if [[ "$nginx_running" == true ]]; then
-        local pid
-        pid=$(cat "$NGINX_PID_FILE")
-        log_ok "nginx is already running (PID: $pid)"
-        if [[ "$needs_action" == true ]]; then
+    # Generate desired plist content
+    local plist_content
+    plist_content="$(_nginx_generate_plist "$nginx_bin")"
+
+    # Install or update the LaunchDaemon plist if needed
+    local plist_changed=false
+    if [[ ! -f "$NGINX_PLIST_PATH" ]] || ! echo "$plist_content" | diff - "$NGINX_PLIST_PATH" &>/dev/null; then
+        # Unload existing service before updating plist
+        if sudo launchctl list "$NGINX_PLIST_LABEL" &>/dev/null; then
+            log_info "Unloading existing nginx service..."
+            sudo launchctl unload "$NGINX_PLIST_PATH" 2>/dev/null || true
+        fi
+        # Stop any non-launchd nginx process
+        if [[ -f "$NGINX_PID_FILE" ]] && kill -0 "$(cat "$NGINX_PID_FILE")" 2>/dev/null; then
+            log_info "Stopping existing nginx process (migrating to launchd)..."
+            sudo nginx -s stop -c "$PROXY_CONFIG" 2>/dev/null || sudo pkill -x nginx 2>/dev/null || true
+            sleep 1
+        fi
+        log_info "Installing LaunchDaemon plist for nginx..."
+        echo "$plist_content" | sudo tee "$NGINX_PLIST_PATH" > /dev/null
+        sudo chmod 644 "$NGINX_PLIST_PATH"
+        sudo chown root:wheel "$NGINX_PLIST_PATH"
+        log_ok "LaunchDaemon installed at $NGINX_PLIST_PATH"
+        plist_changed=true
+    else
+        log_ok "LaunchDaemon plist is up to date"
+    fi
+
+    # Ensure the service is loaded and running
+    if ! sudo launchctl list "$NGINX_PLIST_LABEL" &>/dev/null || [[ "$plist_changed" == true ]]; then
+        # Stop any rogue nginx process before launchd takes over
+        if pgrep -x nginx &>/dev/null; then
+            sudo nginx -s stop -c "$PROXY_CONFIG" 2>/dev/null || sudo pkill -x nginx 2>/dev/null || true
+            sleep 1
+        fi
+        log_info "Loading nginx LaunchDaemon (starts now and on every boot)..."
+        sudo launchctl load "$NGINX_PLIST_PATH"
+        sleep 2
+        if pgrep -x nginx &>/dev/null; then
+            log_ok "nginx started via launchd (PID: $(pgrep -x nginx | head -1))"
+        else
+            log_err "nginx failed to start via launchd. Check logs:"
+            log_info "  cat $NGINX_LOG_DIR/launchd-stderr.log"
+            log_info "  cat $NGINX_LOG_DIR/error.log"
+            exit 1
+        fi
+    else
+        log_ok "nginx is running via launchd (PID: $(pgrep -x nginx | head -1 || echo 'unknown'))"
+        if [[ "$PROXY_CONFIG_CHANGED" == true || "$CERT_NEEDS_REGEN" == true ]]; then
             log_info "Configuration or certificates changed, reloading..."
             sudo nginx -s reload -c "$PROXY_CONFIG" 2>/dev/null && \
                 log_ok "nginx reloaded with new configuration" || \
                 { log_err "nginx reload failed"; exit 1; }
         else
             log_info "No changes, skipping reload"
-        fi
-    else
-        log_info "Starting nginx..."
-        log_info "nginx needs to bind to port 443 — may prompt for sudo password"
-        sudo nginx -c "$PROXY_CONFIG"
-        if [[ -f "$NGINX_PID_FILE" ]] && kill -0 "$(cat "$NGINX_PID_FILE")" 2>/dev/null; then
-            log_ok "nginx started (PID: $(cat "$NGINX_PID_FILE"))"
-        else
-            log_err "nginx failed to start. Check logs:"
-            log_info "  cat $NGINX_LOG_DIR/error.log"
-            exit 1
         fi
     fi
 }
@@ -185,7 +244,8 @@ print_active_mappings() {
 }
 
 print_management_commands() {
-    echo "  Stop:    sudo nginx -s stop -c $PROXY_CONFIG"
+    echo "  Stop:    sudo launchctl unload $NGINX_PLIST_PATH"
+    echo "  Start:   sudo launchctl load $NGINX_PLIST_PATH"
     echo "  Logs:    tail -f $NGINX_LOG_DIR/error.log"
     echo "  Reload:  sudo nginx -s reload -c $PROXY_CONFIG"
 }
