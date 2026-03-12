@@ -163,15 +163,30 @@ manage_proxy() {
             exit 1
         fi
     else
-        log_ok "Caddy is running via launchd (PID: $(pgrep -x caddy | head -1 || echo 'unknown'))"
-        if [[ "$PROXY_CONFIG_CHANGED" == true || "$CERT_NEEDS_REGEN" == true ]]; then
-            log_info "Configuration or certificates changed, reloading..."
-            caddy reload --config "$PROXY_CONFIG" 2>/dev/null && \
-                log_ok "Caddy reloaded with new configuration" || \
-                { log_warn "Reload failed, trying with --force..."; \
-                  caddy reload --config "$PROXY_CONFIG" --force && log_ok "Caddy force-reloaded"; }
+        if pgrep -x caddy &>/dev/null; then
+            log_ok "Caddy is running via launchd (PID: $(pgrep -x caddy | head -1))"
+            if [[ "$PROXY_CONFIG_CHANGED" == true || "$CERT_NEEDS_REGEN" == true ]]; then
+                log_info "Configuration or certificates changed, reloading..."
+                caddy reload --config "$PROXY_CONFIG" 2>/dev/null && \
+                    log_ok "Caddy reloaded with new configuration" || \
+                    { log_warn "Reload failed, trying with --force..."; \
+                      caddy reload --config "$PROXY_CONFIG" --force && log_ok "Caddy force-reloaded"; }
+            else
+                log_info "No changes, skipping reload"
+            fi
         else
-            log_info "No changes, skipping reload"
+            log_warn "LaunchDaemon is loaded but Caddy is not running — restarting..."
+            sudo launchctl unload "$CADDY_PLIST_PATH" 2>/dev/null || true
+            sleep 1
+            sudo launchctl load "$CADDY_PLIST_PATH"
+            sleep 1
+            if pgrep -x caddy &>/dev/null; then
+                log_ok "Caddy restarted via launchd (PID: $(pgrep -x caddy | head -1))"
+            else
+                log_err "Caddy failed to restart. Check logs:"
+                log_info "  cat $CADDY_LOG_DIR/caddy-error.log"
+                exit 1
+            fi
         fi
     fi
 }

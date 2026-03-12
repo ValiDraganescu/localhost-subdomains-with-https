@@ -218,14 +218,30 @@ manage_proxy() {
             exit 1
         fi
     else
-        log_ok "nginx is running via launchd (PID: $(pgrep -x nginx | head -1 || echo 'unknown'))"
-        if [[ "$PROXY_CONFIG_CHANGED" == true || "$CERT_NEEDS_REGEN" == true ]]; then
-            log_info "Configuration or certificates changed, reloading..."
-            sudo nginx -s reload -c "$PROXY_CONFIG" 2>/dev/null && \
-                log_ok "nginx reloaded with new configuration" || \
-                { log_err "nginx reload failed"; exit 1; }
+        if pgrep -x nginx &>/dev/null; then
+            log_ok "nginx is running via launchd (PID: $(pgrep -x nginx | head -1))"
+            if [[ "$PROXY_CONFIG_CHANGED" == true || "$CERT_NEEDS_REGEN" == true ]]; then
+                log_info "Configuration or certificates changed, reloading..."
+                sudo nginx -s reload -c "$PROXY_CONFIG" 2>/dev/null && \
+                    log_ok "nginx reloaded with new configuration" || \
+                    { log_err "nginx reload failed"; exit 1; }
+            else
+                log_info "No changes, skipping reload"
+            fi
         else
-            log_info "No changes, skipping reload"
+            log_warn "LaunchDaemon is loaded but nginx is not running — restarting..."
+            sudo launchctl unload "$NGINX_PLIST_PATH" 2>/dev/null || true
+            sleep 1
+            sudo launchctl load "$NGINX_PLIST_PATH"
+            sleep 2
+            if pgrep -x nginx &>/dev/null; then
+                log_ok "nginx restarted via launchd (PID: $(pgrep -x nginx | head -1))"
+            else
+                log_err "nginx failed to restart. Check logs:"
+                log_info "  cat $NGINX_LOG_DIR/launchd-stderr.log"
+                log_info "  cat $NGINX_LOG_DIR/error.log"
+                exit 1
+            fi
         fi
     fi
 }
